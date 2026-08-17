@@ -9,5 +9,9 @@ services:
         generateValue: true
       - key: DATABASE_URL
         sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SELLER_PASSWORD
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.0
