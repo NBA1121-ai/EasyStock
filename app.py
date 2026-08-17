@@ -37,7 +37,7 @@ TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Учёт товаров</title>
+    <title>EasyStock</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; color: #333; padding: 20px; }
@@ -77,7 +77,7 @@ TEMPLATE = '''
 </head>
 <body>
 <div class="container">
-    <h1>Учёт товаров</h1>
+    <h1>EasyStock</h1>
 
     <div class="card">
         <h2>Добавить товар</h2>
