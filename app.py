@@ -3,6 +3,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import sqlite3
 import os
+import tempfile
+import openpyxl
+import pdfplumber
+import re
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -585,7 +589,10 @@ body {
   <div class="page" id="page-income">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
       <div style="font-size:12px;color:var(--text3);">Приход товаров</div>
-      <button class="btn btn-primary" onclick="openModal('incomeModal')">+ Новый приход</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-secondary" onclick="openModal('uploadModal')">📎 Загрузить из файла</button>
+        <button class="btn btn-primary" onclick="openModal('incomeModal')">+ Новый приход</button>
+      </div>
     </div>
     <div class="card">
       <table class="tbl">
@@ -879,6 +886,52 @@ body {
   </div>
 </div>
 
+<!-- UPLOAD MODAL -->
+<div class="modal-overlay" id="uploadModal">
+  <div class="modal" style="width:700px;">
+    <div class="modal-header">
+      <div class="modal-title">📎 Загрузить приход из файла</div>
+      <span class="modal-close" onclick="closeModal('uploadModal')">✕</span>
+    </div>
+    <div class="modal-body">
+      <div style="margin-bottom:16px;">
+        <div style="font-size:12px;color:var(--text2);margin-bottom:8px;">Поддерживаемые форматы: Excel (.xlsx, .xls) и PDF</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">
+          Файл должен содержать колонки: <strong>Название товара</strong>, <strong>Количество</strong>, <strong>Цена</strong>.
+          Система попробует автоматически найти эти колонки.
+        </div>
+        <form id="uploadForm" enctype="multipart/form-data">
+          <div style="display:flex;gap:10px;align-items:end;">
+            <div style="flex:1;">
+              <label class="form-label">Файл</label>
+              <input class="form-control" type="file" name="file" id="uploadFile" accept=".xlsx,.xls,.pdf" required>
+            </div>
+            <div>
+              <label class="form-label">Дата прихода</label>
+              <input class="form-control" type="date" name="date" id="uploadDate" value="{{ today }}" style="width:160px;">
+            </div>
+            <button type="button" class="btn btn-primary" onclick="uploadFile()" style="white-space:nowrap;">Загрузить</button>
+          </div>
+        </form>
+      </div>
+      <div id="uploadPreview" style="display:none;">
+        <div style="font-size:12px;font-weight:700;margin-bottom:8px;">Предпросмотр:</div>
+        <div id="uploadAlert" style="display:none;" class="alert-info" style="padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:10px;background:rgba(79,142,247,0.1);border:1px solid rgba(79,142,247,0.3);color:var(--accent);"></div>
+        <div style="max-height:300px;overflow-y:auto;">
+          <table class="tbl" id="uploadTable">
+            <thead><tr><th>Товар</th><th class="num">Кол-во</th><th class="num">Цена</th><th class="num">Сумма</th><th>Статус</th></tr></thead>
+            <tbody id="uploadBody"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:center;">
+          <div style="font-size:13px;font-weight:700;">Итого: <span id="uploadTotal" style="color:var(--green);">0</span> сом</div>
+          <button class="btn btn-success" onclick="confirmUpload()">✔ Провести приход</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- USER MODAL (add) -->
 {% if role == 'admin' %}
 <div class="modal-overlay" id="userModal">
@@ -998,6 +1051,69 @@ document.addEventListener('keydown', function(e) {
     document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
   }
 });
+
+// File upload
+let uploadedRows = [];
+
+function uploadFile() {
+  const fileInput = document.getElementById('uploadFile');
+  if (!fileInput.files.length) return;
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  fetch('/parse_file', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      uploadedRows = data.rows;
+      const tbody = document.getElementById('uploadBody');
+      const alertDiv = document.getElementById('uploadAlert');
+      let total = 0;
+      let newCount = 0;
+      tbody.innerHTML = '';
+      data.rows.forEach((row, i) => {
+        const sum = row.quantity * row.price;
+        total += sum;
+        const isNew = !row.product_id;
+        if (isNew) newCount++;
+        tbody.innerHTML += '<tr>' +
+          '<td>' + row.name + (isNew ? ' <span style="color:var(--yellow);font-size:10px;">новый</span>' : '') + '</td>' +
+          '<td class="num">' + row.quantity.toFixed(2) + '</td>' +
+          '<td class="num">' + row.price.toFixed(2) + '</td>' +
+          '<td class="num">' + sum.toFixed(2) + '</td>' +
+          '<td>' + (isNew ? '<span class="badge" style="background:rgba(247,196,79,0.15);color:var(--yellow);">Будет создан</span>' : '<span class="badge badge-in">Найден</span>') + '</td>' +
+          '</tr>';
+      });
+      document.getElementById('uploadTotal').textContent = total.toFixed(0);
+      if (newCount > 0) {
+        alertDiv.style.display = 'block';
+        alertDiv.textContent = 'Новых товаров: ' + newCount + ' — будут автоматически добавлены';
+      } else {
+        alertDiv.style.display = 'none';
+      }
+      document.getElementById('uploadPreview').style.display = 'block';
+    })
+    .catch(err => alert('Ошибка: ' + err));
+}
+
+function confirmUpload() {
+  const date = document.getElementById('uploadDate').value;
+  fetch('/import_income', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ rows: uploadedRows, date: date })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      window.location.reload();
+    } else {
+      alert(data.error || 'Ошибка');
+    }
+  });
+}
 </script>
 </body>
 </html>
@@ -1190,6 +1306,209 @@ def delete_user(user_id):
         conn.commit()
         conn.close()
     return redirect(url_for('index'))
+
+@app.route('/parse_file', methods=['POST'])
+@login_required
+def parse_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'Файл не выбран'})
+    f = request.files['file']
+    fname = f.filename.lower()
+
+    try:
+        if fname.endswith(('.xlsx', '.xls')):
+            rows = parse_excel(f)
+        elif fname.endswith('.pdf'):
+            rows = parse_pdf(f)
+        else:
+            return jsonify({'error': 'Неподдерживаемый формат. Используйте .xlsx или .pdf'})
+    except Exception as e:
+        return jsonify({'error': f'Ошибка чтения файла: {str(e)}'})
+
+    if not rows:
+        return jsonify({'error': 'Не удалось найти данные в файле. Убедитесь что есть колонки: название, количество, цена.'})
+
+    # Match with existing products
+    conn = get_db()
+    products = conn.execute('SELECT id, name FROM products').fetchall()
+    conn.close()
+    product_map = {p['name'].lower().strip(): p['id'] for p in products}
+
+    for row in rows:
+        name_lower = row['name'].lower().strip()
+        row['product_id'] = product_map.get(name_lower)
+
+    return jsonify({'rows': rows})
+
+
+def parse_excel(f):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+    f.save(tmp.name)
+    tmp.close()
+
+    wb = openpyxl.load_workbook(tmp.name, read_only=True)
+    ws = wb.active
+    rows_data = []
+
+    # Find header row
+    header_row = None
+    name_col = qty_col = price_col = None
+    name_keywords = ['название', 'наименование', 'товар', 'продукт', 'name', 'item', 'позиция']
+    qty_keywords = ['количество', 'кол-во', 'кол', 'qty', 'quantity', 'шт']
+    price_keywords = ['цена', 'стоимость', 'price', 'cost', 'сумма за ед']
+
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=False), 1):
+        for j, cell in enumerate(row):
+            val = str(cell.value or '').lower().strip()
+            if any(k in val for k in name_keywords):
+                name_col = j
+                header_row = i
+            if any(k in val for k in qty_keywords):
+                qty_col = j
+            if any(k in val for k in price_keywords):
+                price_col = j
+        if header_row:
+            break
+
+    # If no header found, assume columns: A=name, B=qty, C=price
+    if header_row is None:
+        header_row = 0
+        name_col = 0
+        qty_col = 1
+        price_col = 2
+
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=False):
+        cells = list(row)
+        if name_col is not None and name_col < len(cells):
+            name = str(cells[name_col].value or '').strip()
+        else:
+            continue
+        if not name or name.lower() in ('итого', 'total', 'всего', ''):
+            continue
+
+        qty = 0
+        price = 0
+        if qty_col is not None and qty_col < len(cells):
+            try:
+                qty = float(cells[qty_col].value or 0)
+            except (ValueError, TypeError):
+                continue
+        if price_col is not None and price_col < len(cells):
+            try:
+                price = float(cells[price_col].value or 0)
+            except (ValueError, TypeError):
+                price = 0
+
+        if qty > 0 and name:
+            rows_data.append({'name': name, 'quantity': qty, 'price': price})
+
+    wb.close()
+    os.unlink(tmp.name)
+    return rows_data
+
+
+def parse_pdf(f):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    f.save(tmp.name)
+    tmp.close()
+
+    rows_data = []
+    with pdfplumber.open(tmp.name) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                if not table:
+                    continue
+                # Find header
+                header_idx = None
+                name_col = qty_col = price_col = None
+                name_keywords = ['название', 'наименование', 'товар', 'продукт', 'позиция']
+                qty_keywords = ['количество', 'кол-во', 'кол', 'шт']
+                price_keywords = ['цена', 'стоимость', 'сумма за ед']
+
+                for i, row in enumerate(table):
+                    for j, cell in enumerate(row):
+                        val = str(cell or '').lower().strip()
+                        if any(k in val for k in name_keywords):
+                            name_col = j
+                            header_idx = i
+                        if any(k in val for k in qty_keywords):
+                            qty_col = j
+                        if any(k in val for k in price_keywords):
+                            price_col = j
+                    if header_idx is not None:
+                        break
+
+                if header_idx is None:
+                    # Try: first col = name, find numbers in other cols
+                    header_idx = 0
+                    name_col = 0
+                    qty_col = 1 if len(table[0]) > 1 else None
+                    price_col = 2 if len(table[0]) > 2 else None
+
+                for row in table[header_idx + 1:]:
+                    if name_col is not None and name_col < len(row):
+                        name = str(row[name_col] or '').strip()
+                    else:
+                        continue
+                    if not name or name.lower() in ('итого', 'total', 'всего'):
+                        continue
+
+                    qty = 0
+                    price = 0
+                    if qty_col is not None and qty_col < len(row):
+                        try:
+                            qty = float(re.sub(r'[^\d.,]', '', str(row[qty_col] or '0')).replace(',', '.') or 0)
+                        except (ValueError, TypeError):
+                            continue
+                    if price_col is not None and price_col < len(row):
+                        try:
+                            price = float(re.sub(r'[^\d.,]', '', str(row[price_col] or '0')).replace(',', '.') or 0)
+                        except (ValueError, TypeError):
+                            price = 0
+
+                    if qty > 0 and name:
+                        rows_data.append({'name': name, 'quantity': qty, 'price': price})
+
+    os.unlink(tmp.name)
+    return rows_data
+
+
+@app.route('/import_income', methods=['POST'])
+@login_required
+def import_income():
+    data = request.get_json()
+    rows = data.get('rows', [])
+    date = data.get('date', '')
+    conn = get_db()
+
+    for row in rows:
+        name = row['name'].strip()
+        qty = float(row['quantity'])
+        price = float(row['price'])
+        product_id = row.get('product_id')
+
+        # Create product if not exists
+        if not product_id:
+            try:
+                conn.execute('INSERT INTO products (name) VALUES (?)', (name,))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                pass
+            p = conn.execute('SELECT id FROM products WHERE name = ?', (name,)).fetchone()
+            product_id = p['id']
+
+        if date:
+            conn.execute('INSERT INTO transactions (product_id, type, quantity, price, date) VALUES (?, ?, ?, ?, ?)',
+                         (product_id, 'in', qty, price, date))
+        else:
+            conn.execute('INSERT INTO transactions (product_id, type, quantity, price) VALUES (?, ?, ?, ?)',
+                         (product_id, 'in', qty, price))
+
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'count': len(rows)})
+
 
 if __name__ == '__main__':
     init_db()
