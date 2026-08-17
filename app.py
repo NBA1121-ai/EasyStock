@@ -13,6 +13,18 @@ app.secret_key = os.environ.get('SECRET_KEY', 'easystock-secret-key-change-me')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 USE_PG = DATABASE_URL.startswith('postgres')
 
+# Пароли стартовых учёток. На проде задаются переменными окружения,
+# локально — привычные значения для удобства разработки.
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
+SELLER_PASSWORD = os.environ.get('SELLER_PASSWORD', 'seller123')
+
+if USE_PG and not os.environ.get('ADMIN_PASSWORD'):
+    print('[EasyStock] ВНИМАНИЕ: ADMIN_PASSWORD не задан, используется admin123. '
+          'Смените пароль сразу после первого входа.')
+if USE_PG and not os.environ.get('SECRET_KEY'):
+    print('[EasyStock] ВНИМАНИЕ: SECRET_KEY не задан, сессии уязвимы. '
+          'Задайте SECRET_KEY в переменных окружения.')
+
 if USE_PG:
     import psycopg2
     import psycopg2.extras
@@ -74,7 +86,7 @@ def init_db():
                 type TEXT NOT NULL CHECK(type IN ('in', 'out')),
                 quantity REAL NOT NULL,
                 price REAL NOT NULL,
-                date TEXT NOT NULL DEFAULT CURRENT_DATE
+                date TEXT NOT NULL DEFAULT (CURRENT_DATE::text)
             )
         ''')
         cur.execute('''
@@ -89,15 +101,15 @@ def init_db():
         # Default users
         try:
             cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
-                        ('admin', generate_password_hash('admin123'), 'admin'))
+                        ('admin', generate_password_hash(ADMIN_PASSWORD), 'admin'))
             conn.commit()
-        except:
+        except psycopg2.errors.UniqueViolation:
             conn.rollback()
         try:
             cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
-                        ('seller', generate_password_hash('seller123'), 'seller'))
+                        ('seller', generate_password_hash(SELLER_PASSWORD), 'seller'))
             conn.commit()
-        except:
+        except psycopg2.errors.UniqueViolation:
             conn.rollback()
         cur.close()
     else:
@@ -124,16 +136,16 @@ def init_db():
         ''')
         try:
             conn.execute('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "seller"')
-        except:
-            pass
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         try:
             conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                         ('admin', generate_password_hash('admin123'), 'admin'))
+                         ('admin', generate_password_hash(ADMIN_PASSWORD), 'admin'))
         except sqlite3.IntegrityError:
             pass
         try:
             conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                         ('seller', generate_password_hash('seller123'), 'seller'))
+                         ('seller', generate_password_hash(SELLER_PASSWORD), 'seller'))
         except sqlite3.IntegrityError:
             pass
         conn.commit()
@@ -261,8 +273,9 @@ body {
     </div>
     <button type="submit" class="btn-login">Войти</button>
   </form>
+  {% if is_local %}
   <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:16px;">
-    <div style="font-size:11px;color:var(--text3);margin-bottom:10px;text-align:center;">Быстрый вход:</div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:10px;text-align:center;">Быстрый вход (только локально):</div>
     <div style="display:flex;gap:8px;">
       <button onclick="fillLogin('admin','admin123')" style="flex:1;padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius2);color:var(--text);cursor:pointer;font-family:inherit;font-size:12px;transition:all 0.15s;">
         <div style="font-weight:700;color:var(--accent);">Админ</div>
@@ -274,7 +287,9 @@ body {
       </button>
     </div>
   </div>
+  {% endif %}
 </div>
+{% if is_local %}
 <script>
 function fillLogin(u, p) {
   document.querySelector('input[name="username"]').value = u;
@@ -282,6 +297,7 @@ function fillLogin(u, p) {
   document.querySelector('form').submit();
 }
 </script>
+{% endif %}
 </body>
 </html>
 '''
@@ -1215,7 +1231,7 @@ def login():
             session['role'] = user['role']
             return redirect(url_for('index'))
         error = 'Неверный логин или пароль'
-    return render_template_string(LOGIN_TEMPLATE, error=error)
+    return render_template_string(LOGIN_TEMPLATE, error=error, is_local=not USE_PG)
 
 @app.route('/logout')
 def logout():
