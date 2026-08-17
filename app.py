@@ -53,7 +53,10 @@ def db_execute(conn, query, params=None):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         # Convert ? placeholders to %s for PostgreSQL
         query = query.replace('?', '%s')
-        cur.execute(query, params or ())
+        # params=None отключает подстановку в psycopg2. С пустым кортежем
+        # она включается, и любой литерал % в SQL (например, LIKE '%текст%')
+        # ломает запрос.
+        cur.execute(query, params if params else None)
         return cur
     else:
         return conn.execute(query, params or ())
