@@ -1,7 +1,6 @@
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-import sqlite3
 import os
 import tempfile
 import openpyxl
@@ -9,55 +8,135 @@ import pdfplumber
 import re
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24).hex()
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'inventory.db')
+app.secret_key = os.environ.get('SECRET_KEY', 'easystock-secret-key-change-me')
+
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+USE_PG = DATABASE_URL.startswith('postgres')
+
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+    if DATABASE_URL.startswith('postgres://'):
+        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+else:
+    import sqlite3
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'inventory.db')
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    if USE_PG:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+
+def db_execute(conn, query, params=None):
+    """Execute query compatible with both SQLite and PostgreSQL."""
+    if USE_PG:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Convert ? placeholders to %s for PostgreSQL
+        query = query.replace('?', '%s')
+        cur.execute(query, params or ())
+        return cur
+    else:
+        return conn.execute(query, params or ())
+
+
+def db_fetchall(conn, query, params=None):
+    cur = db_execute(conn, query, params)
+    return cur.fetchall()
+
+
+def db_fetchone(conn, query, params=None):
+    cur = db_execute(conn, query, params)
+    return cur.fetchone()
+
 
 def init_db():
     conn = get_db()
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-        );
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('in', 'out')),
-            quantity REAL NOT NULL,
-            price REAL NOT NULL,
-            date TEXT NOT NULL DEFAULT (date('now')),
-            FOREIGN KEY (product_id) REFERENCES products(id)
-        );
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'seller'
-        );
-    ''')
-    # Add role column if missing (upgrade from old DB)
-    try:
-        conn.execute('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "seller"')
-    except:
-        pass
-    # Default users
-    try:
-        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                     ('admin', generate_password_hash('admin123'), 'admin'))
-    except sqlite3.IntegrityError:
-        pass
-    try:
-        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                     ('seller', generate_password_hash('seller123'), 'seller'))
-    except sqlite3.IntegrityError:
-        pass
-    conn.commit()
+    if USE_PG:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                type TEXT NOT NULL CHECK(type IN ('in', 'out')),
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                date TEXT NOT NULL DEFAULT CURRENT_DATE
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'seller'
+            )
+        ''')
+        conn.commit()
+        # Default users
+        try:
+            cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
+                        ('admin', generate_password_hash('admin123'), 'admin'))
+            conn.commit()
+        except:
+            conn.rollback()
+        try:
+            cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
+                        ('seller', generate_password_hash('seller123'), 'seller'))
+            conn.commit()
+        except:
+            conn.rollback()
+        cur.close()
+    else:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('in', 'out')),
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                date TEXT NOT NULL DEFAULT (date('now')),
+                FOREIGN KEY (product_id) REFERENCES products(id)
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'seller'
+            );
+        ''')
+        try:
+            conn.execute('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "seller"')
+        except:
+            pass
+        try:
+            conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                         ('admin', generate_password_hash('admin123'), 'admin'))
+        except sqlite3.IntegrityError:
+            pass
+        try:
+            conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                         ('seller', generate_password_hash('seller123'), 'seller'))
+        except sqlite3.IntegrityError:
+            pass
+        conn.commit()
     conn.close()
 
 def login_required(f):
@@ -1128,7 +1207,7 @@ def login():
         username = request.form['username'].strip()
         password = request.form['password']
         conn = get_db()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        user = db_fetchone(conn, 'SELECT * FROM users WHERE username = ?', (username,))
         conn.close()
         if user and check_password_hash(user['password'], password):
             session['user_id'] = user['id']
@@ -1147,12 +1226,12 @@ def logout():
 @login_required
 def index():
     conn = get_db()
-    products = conn.execute('SELECT * FROM products ORDER BY name').fetchall()
+    products = db_fetchall(conn, 'SELECT * FROM products ORDER BY name')
 
     from datetime import date
     today = date.today().isoformat()
 
-    inventory = conn.execute('''
+    inventory = db_fetchall(conn, '''
         SELECT
             p.name,
             COALESCE(SUM(CASE WHEN t.type='in' THEN t.quantity ELSE 0 END), 0)
@@ -1171,16 +1250,16 @@ def index():
               - COALESCE(SUM(CASE WHEN t.type='in' THEN t.quantity * t.price ELSE 0 END), 0) AS profit
         FROM products p
         LEFT JOIN transactions t ON p.id = t.product_id
-        GROUP BY p.id
+        GROUP BY p.id, p.name
         ORDER BY p.name
-    ''').fetchall()
+    ''')
 
-    row = conn.execute('''
+    row = db_fetchone(conn, '''
         SELECT
             COALESCE(SUM(CASE WHEN type='in' THEN quantity * price ELSE 0 END), 0) AS total_in,
             COALESCE(SUM(CASE WHEN type='out' THEN quantity * price ELSE 0 END), 0) AS total_out
         FROM transactions
-    ''').fetchone()
+    ''')
     summary = {
         'total_products': len(products),
         'total_in': row['total_in'],
@@ -1188,17 +1267,17 @@ def index():
         'profit': row['total_out'] - row['total_in']
     }
 
-    transactions = conn.execute('''
+    transactions = db_fetchall(conn, '''
         SELECT t.*, p.name AS product_name
         FROM transactions t
         JOIN products p ON t.product_id = p.id
         ORDER BY t.date DESC, t.id DESC
         LIMIT 100
-    ''').fetchall()
+    ''')
 
     users = []
     if session.get('role') == 'admin':
-        users = conn.execute('SELECT * FROM users ORDER BY id').fetchall()
+        users = db_fetchall(conn, 'SELECT * FROM users ORDER BY id')
 
     conn.close()
     return render_template_string(TEMPLATE, products=products, inventory=inventory,
@@ -1213,10 +1292,10 @@ def add_product():
     if name:
         conn = get_db()
         try:
-            conn.execute('INSERT INTO products (name) VALUES (?)', (name,))
+            db_execute(conn, 'INSERT INTO products (name) VALUES (?)', (name,))
             conn.commit()
-        except sqlite3.IntegrityError:
-            pass
+        except Exception:
+            if USE_PG: conn.rollback()
         conn.close()
     return redirect(url_for('index'))
 
@@ -1230,11 +1309,11 @@ def add_transaction():
     date = request.form.get('date', '')
     conn = get_db()
     if date:
-        conn.execute('INSERT INTO transactions (product_id, type, quantity, price, date) VALUES (?, ?, ?, ?, ?)',
-                     (product_id, tx_type, quantity, price, date))
+        db_execute(conn, 'INSERT INTO transactions (product_id, type, quantity, price, date) VALUES (?, ?, ?, ?, ?)',
+                   (product_id, tx_type, quantity, price, date))
     else:
-        conn.execute('INSERT INTO transactions (product_id, type, quantity, price) VALUES (?, ?, ?, ?)',
-                     (product_id, tx_type, quantity, price))
+        db_execute(conn, 'INSERT INTO transactions (product_id, type, quantity, price) VALUES (?, ?, ?, ?)',
+                   (product_id, tx_type, quantity, price))
     conn.commit()
     conn.close()
     return redirect(url_for('index'))
@@ -1243,7 +1322,7 @@ def add_transaction():
 @login_required
 def delete_transaction(tx_id):
     conn = get_db()
-    conn.execute('DELETE FROM transactions WHERE id = ?', (tx_id,))
+    db_execute(conn, 'DELETE FROM transactions WHERE id = ?', (tx_id,))
     conn.commit()
     conn.close()
     return redirect(url_for('index'))
@@ -1252,8 +1331,8 @@ def delete_transaction(tx_id):
 @login_required
 def delete_product(product_id):
     conn = get_db()
-    conn.execute('DELETE FROM transactions WHERE product_id = ?', (product_id,))
-    conn.execute('DELETE FROM products WHERE id = ?', (product_id,))
+    db_execute(conn, 'DELETE FROM transactions WHERE product_id = ?', (product_id,))
+    db_execute(conn, 'DELETE FROM products WHERE id = ?', (product_id,))
     conn.commit()
     conn.close()
     return redirect(url_for('index'))
@@ -1267,11 +1346,11 @@ def add_user():
     if username and password:
         conn = get_db()
         try:
-            conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                         (username, generate_password_hash(password), role))
+            db_execute(conn, 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                       (username, generate_password_hash(password), role))
             conn.commit()
-        except sqlite3.IntegrityError:
-            pass
+        except Exception:
+            if USE_PG: conn.rollback()
         conn.close()
     return redirect(url_for('index'))
 
@@ -1284,14 +1363,13 @@ def edit_user():
     role = request.form['role']
     conn = get_db()
     if password:
-        conn.execute('UPDATE users SET username=?, password=?, role=? WHERE id=?',
-                     (username, generate_password_hash(password), role, user_id))
+        db_execute(conn, 'UPDATE users SET username=?, password=?, role=? WHERE id=?',
+                   (username, generate_password_hash(password), role, user_id))
     else:
-        conn.execute('UPDATE users SET username=?, role=? WHERE id=?',
-                     (username, role, user_id))
+        db_execute(conn, 'UPDATE users SET username=?, role=? WHERE id=?',
+                   (username, role, user_id))
     conn.commit()
     conn.close()
-    # Update session if editing self
     if user_id == session.get('user_id'):
         session['username'] = username
         session['role'] = role
@@ -1302,7 +1380,7 @@ def edit_user():
 def delete_user(user_id):
     if user_id != session.get('user_id'):
         conn = get_db()
-        conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        db_execute(conn, 'DELETE FROM users WHERE id = ?', (user_id,))
         conn.commit()
         conn.close()
     return redirect(url_for('index'))
@@ -1330,7 +1408,7 @@ def parse_file():
 
     # Match with existing products
     conn = get_db()
-    products = conn.execute('SELECT id, name FROM products').fetchall()
+    products = db_fetchall(conn, 'SELECT id, name FROM products')
     conn.close()
     product_map = {p['name'].lower().strip(): p['id'] for p in products}
 
@@ -1491,25 +1569,26 @@ def import_income():
         # Create product if not exists
         if not product_id:
             try:
-                conn.execute('INSERT INTO products (name) VALUES (?)', (name,))
+                db_execute(conn, 'INSERT INTO products (name) VALUES (?)', (name,))
                 conn.commit()
-            except sqlite3.IntegrityError:
-                pass
-            p = conn.execute('SELECT id FROM products WHERE name = ?', (name,)).fetchone()
+            except Exception:
+                if USE_PG: conn.rollback()
+            p = db_fetchone(conn, 'SELECT id FROM products WHERE name = ?', (name,))
             product_id = p['id']
 
         if date:
-            conn.execute('INSERT INTO transactions (product_id, type, quantity, price, date) VALUES (?, ?, ?, ?, ?)',
-                         (product_id, 'in', qty, price, date))
+            db_execute(conn, 'INSERT INTO transactions (product_id, type, quantity, price, date) VALUES (?, ?, ?, ?, ?)',
+                       (product_id, 'in', qty, price, date))
         else:
-            conn.execute('INSERT INTO transactions (product_id, type, quantity, price) VALUES (?, ?, ?, ?)',
-                         (product_id, 'in', qty, price))
+            db_execute(conn, 'INSERT INTO transactions (product_id, type, quantity, price) VALUES (?, ?, ?, ?)',
+                       (product_id, 'in', qty, price))
 
     conn.commit()
     conn.close()
     return jsonify({'ok': True, 'count': len(rows)})
 
 
+init_db()
+
 if __name__ == '__main__':
-    init_db()
     app.run(debug=True, host='0.0.0.0', port=5000)

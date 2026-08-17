@@ -1,2 +1,6 @@
 flask
-waitress\nopenpyxl\npdfplumber
+waitress
+openpyxl
+pdfplumber
+gunicorn
+psycopg2-binary
