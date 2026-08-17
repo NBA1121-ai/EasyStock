@@ -87,6 +87,7 @@ LOGIN_TEMPLATE = '''
   --border: #2a3347; --border2: #374056;
   --text: #e8ecf4; --text2: #8b95b0; --text3: #5a6480;
   --accent: #4f8ef7; --accent2: #3b6fd4;
+  --green: #2ecc8a;
   --red: #f74f4f;
   --radius: 10px; --radius2: 6px;
 }
@@ -177,7 +178,27 @@ body {
     </div>
     <button type="submit" class="btn-login">Войти</button>
   </form>
+  <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:16px;">
+    <div style="font-size:11px;color:var(--text3);margin-bottom:10px;text-align:center;">Быстрый вход:</div>
+    <div style="display:flex;gap:8px;">
+      <button onclick="fillLogin('admin','admin123')" style="flex:1;padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius2);color:var(--text);cursor:pointer;font-family:inherit;font-size:12px;transition:all 0.15s;">
+        <div style="font-weight:700;color:var(--accent);">Админ</div>
+        <div style="color:var(--text3);font-size:10px;margin-top:2px;">admin / admin123</div>
+      </button>
+      <button onclick="fillLogin('seller','seller123')" style="flex:1;padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius2);color:var(--text);cursor:pointer;font-family:inherit;font-size:12px;transition:all 0.15s;">
+        <div style="font-weight:700;color:var(--green);">Продавец</div>
+        <div style="color:var(--text3);font-size:10px;margin-top:2px;">seller / seller123</div>
+      </button>
+    </div>
+  </div>
 </div>
+<script>
+function fillLogin(u, p) {
+  document.querySelector('input[name="username"]').value = u;
+  document.querySelector('input[name="password"]').value = p;
+  document.querySelector('form').submit();
+}
+</script>
 </body>
 </html>
 '''
