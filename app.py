@@ -1,8 +1,11 @@
-from flask import Flask, request, redirect, url_for, render_template_string, jsonify
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 import sqlite3
 import os
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24).hex()
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'inventory.db')
 
 def get_db():
@@ -27,9 +30,136 @@ def init_db():
             date TEXT NOT NULL DEFAULT (date('now')),
             FOREIGN KEY (product_id) REFERENCES products(id)
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL
+        );
     ''')
+    # Default admin user: admin / admin123
+    try:
+        conn.execute('INSERT INTO users (username, password) VALUES (?, ?)',
+                     ('admin', generate_password_hash('admin123')))
+    except sqlite3.IntegrityError:
+        pass
     conn.commit()
     conn.close()
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EasyStock - Вход</title>
+<style>
+:root {
+  --bg: #0e1117; --bg2: #161b27; --bg3: #1e2535;
+  --border: #2a3347; --border2: #374056;
+  --text: #e8ecf4; --text2: #8b95b0; --text3: #5a6480;
+  --accent: #4f8ef7; --accent2: #3b6fd4;
+  --red: #f74f4f;
+  --radius: 10px; --radius2: 6px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 40px;
+  width: 380px;
+  max-width: 95vw;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+}
+.login-logo {
+  text-align: center;
+  margin-bottom: 30px;
+}
+.login-logo h1 {
+  font-size: 24px;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+}
+.login-logo p {
+  font-size: 12px;
+  color: var(--text3);
+  margin-top: 4px;
+}
+.form-group { margin-bottom: 16px; }
+.form-label {
+  display: block; font-size: 11px; font-weight: 600;
+  color: var(--text2); margin-bottom: 5px;
+}
+.form-control {
+  width: 100%; padding: 10px 14px;
+  background: var(--bg3); border: 1px solid var(--border2);
+  border-radius: var(--radius2); color: var(--text);
+  font-family: inherit; font-size: 14px;
+  outline: none; transition: border-color 0.15s;
+}
+.form-control:focus { border-color: var(--accent); }
+.btn-login {
+  width: 100%; padding: 12px;
+  background: var(--accent); color: #fff;
+  border: none; border-radius: var(--radius2);
+  font-size: 14px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s;
+}
+.btn-login:hover { background: var(--accent2); }
+.error-msg {
+  background: rgba(247,79,79,0.1);
+  border: 1px solid rgba(247,79,79,0.3);
+  color: var(--red);
+  padding: 8px 12px;
+  border-radius: var(--radius2);
+  font-size: 12px;
+  margin-bottom: 16px;
+  text-align: center;
+}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="login-logo">
+    <h1>EasyStock</h1>
+    <p>Войдите в систему</p>
+  </div>
+  {% if error %}
+  <div class="error-msg">{{ error }}</div>
+  {% endif %}
+  <form method="POST">
+    <div class="form-group">
+      <label class="form-label">Логин</label>
+      <input class="form-control" type="text" name="username" placeholder="Введите логин" required autofocus>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Пароль</label>
+      <input class="form-control" type="password" name="password" placeholder="Введите пароль" required>
+    </div>
+    <button type="submit" class="btn-login">Войти</button>
+  </form>
+</div>
+</body>
+</html>
+'''
 
 TEMPLATE = '''
 <!DOCTYPE html>
@@ -324,6 +454,11 @@ body {
       <span class="icon">📁</span> <span>Товары</span>
     </a>
   </nav>
+  <div style="padding:16px 18px;border-top:1px solid var(--border);">
+    <a href="/logout" class="nav-item" style="padding:8px 0;border:none;color:var(--red);">
+      <span class="icon">🚪</span> <span>Выйти</span>
+    </a>
+  </div>
 </aside>
 
 <!-- MAIN -->
@@ -704,7 +839,31 @@ document.addEventListener('keydown', function(e) {
 </html>
 '''
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+    error = None
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+        conn = get_db()
+        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user['password'], password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            return redirect(url_for('index'))
+        error = 'Неверный логин или пароль'
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
 @app.route('/')
+@login_required
 def index():
     conn = get_db()
     products = conn.execute('SELECT * FROM products ORDER BY name').fetchall()
@@ -761,6 +920,7 @@ def index():
                                   transactions=transactions, summary=summary, today=today)
 
 @app.route('/add_product', methods=['POST'])
+@login_required
 def add_product():
     name = request.form['name'].strip()
     if name:
@@ -774,6 +934,7 @@ def add_product():
     return redirect(url_for('index'))
 
 @app.route('/add_transaction', methods=['POST'])
+@login_required
 def add_transaction():
     product_id = request.form['product_id']
     tx_type = request.form['type']
@@ -792,6 +953,7 @@ def add_transaction():
     return redirect(url_for('index'))
 
 @app.route('/delete_transaction/<int:tx_id>', methods=['POST'])
+@login_required
 def delete_transaction(tx_id):
     conn = get_db()
     conn.execute('DELETE FROM transactions WHERE id = ?', (tx_id,))
@@ -800,6 +962,7 @@ def delete_transaction(tx_id):
     return redirect(url_for('index'))
 
 @app.route('/delete_product/<int:product_id>', methods=['POST'])
+@login_required
 def delete_product(product_id):
     conn = get_db()
     conn.execute('DELETE FROM transactions WHERE product_id = ?', (product_id,))
