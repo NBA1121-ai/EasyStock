@@ -33,13 +33,24 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'seller'
         );
     ''')
-    # Default admin user: admin / admin123
+    # Add role column if missing (upgrade from old DB)
     try:
-        conn.execute('INSERT INTO users (username, password) VALUES (?, ?)',
-                     ('admin', generate_password_hash('admin123')))
+        conn.execute('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "seller"')
+    except:
+        pass
+    # Default users
+    try:
+        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                     ('admin', generate_password_hash('admin123'), 'admin'))
+    except sqlite3.IntegrityError:
+        pass
+    try:
+        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                     ('seller', generate_password_hash('seller123'), 'seller'))
     except sqlite3.IntegrityError:
         pass
     conn.commit()
@@ -50,6 +61,16 @@ def login_required(f):
     def decorated(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        if session.get('role') != 'admin':
+            return redirect(url_for('index'))
         return f(*args, **kwargs)
     return decorated
 
@@ -453,8 +474,22 @@ body {
     <a class="nav-item" data-page="products" onclick="showPage('products')">
       <span class="icon">📁</span> <span>Товары</span>
     </a>
+    {% if role == 'admin' %}
+    <a class="nav-item" data-page="users" onclick="showPage('users')">
+      <span class="icon">👥</span> <span>Пользователи</span>
+    </a>
+    {% endif %}
   </nav>
   <div style="padding:16px 18px;border-top:1px solid var(--border);">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;">
+        {{ username[0]|upper }}
+      </div>
+      <div>
+        <div style="font-size:12px;font-weight:600;">{{ username }}</div>
+        <div style="font-size:10px;color:var(--text3);">{{ 'Администратор' if role == 'admin' else 'Продавец' }}</div>
+      </div>
+    </div>
     <a href="/logout" class="nav-item" style="padding:8px 0;border:none;color:var(--red);">
       <span class="icon">🚪</span> <span>Выйти</span>
     </a>
@@ -684,6 +719,37 @@ body {
       </table>
     </div>
   </div>
+
+  <!-- USERS PAGE (admin only) -->
+  {% if role == 'admin' %}
+  <div class="page" id="page-users">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <div style="font-size:12px;color:var(--text3);">Управление пользователями</div>
+      <button class="btn btn-primary" onclick="openModal('userModal')">+ Добавить пользователя</button>
+    </div>
+    <div class="card">
+      <table class="tbl">
+        <thead><tr><th>Логин</th><th>Роль</th><th>Действия</th></tr></thead>
+        <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u.username }}</td>
+            <td><span class="badge {{ 'badge-in' if u.role == 'admin' else 'badge-out' }}">{{ 'Админ' if u.role == 'admin' else 'Продавец' }}</span></td>
+            <td style="display:flex;gap:6px;">
+              <button class="btn btn-secondary btn-sm" onclick="openEditUser({{ u.id }}, '{{ u.username }}', '{{ u.role }}')">Изменить</button>
+              {% if u.id != session_user_id %}
+              <form method="POST" action="/delete_user/{{ u.id }}" onsubmit="return confirm('Удалить пользователя?')">
+                <button type="submit" class="btn btn-danger btn-sm">✕</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
 </main>
 
 <!-- INCOME MODAL -->
@@ -792,6 +858,75 @@ body {
   </div>
 </div>
 
+<!-- USER MODAL (add) -->
+{% if role == 'admin' %}
+<div class="modal-overlay" id="userModal">
+  <div class="modal" style="width:420px;">
+    <div class="modal-header">
+      <div class="modal-title">👤 Новый пользователь</div>
+      <span class="modal-close" onclick="closeModal('userModal')">✕</span>
+    </div>
+    <form method="POST" action="/add_user">
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">Логин</label>
+          <input class="form-control" type="text" name="username" placeholder="Введите логин" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Пароль</label>
+          <input class="form-control" type="password" name="password" placeholder="Введите пароль" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Роль</label>
+          <select class="form-control" name="role">
+            <option value="seller">Продавец</option>
+            <option value="admin">Администратор</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('userModal')">Отмена</button>
+        <button type="submit" class="btn btn-primary">+ Добавить</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- USER EDIT MODAL -->
+<div class="modal-overlay" id="editUserModal">
+  <div class="modal" style="width:420px;">
+    <div class="modal-header">
+      <div class="modal-title">✏️ Редактировать пользователя</div>
+      <span class="modal-close" onclick="closeModal('editUserModal')">✕</span>
+    </div>
+    <form method="POST" action="/edit_user">
+      <input type="hidden" name="user_id" id="editUserId">
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">Логин</label>
+          <input class="form-control" type="text" name="username" id="editUserName" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Новый пароль (оставьте пустым чтобы не менять)</label>
+          <input class="form-control" type="password" name="password" placeholder="Новый пароль">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Роль</label>
+          <select class="form-control" name="role" id="editUserRole">
+            <option value="seller">Продавец</option>
+            <option value="admin">Администратор</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('editUserModal')">Отмена</button>
+        <button type="submit" class="btn btn-success">✔ Сохранить</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+
 <!-- NOTIFICATION -->
 <div class="notif" id="notif"></div>
 
@@ -802,7 +937,8 @@ const pageTitles = {
   expense: 'Расход',
   stock: 'Остатки',
   history: 'История операций',
-  products: 'Товары'
+  products: 'Товары',
+  users: 'Пользователи'
 };
 
 function showPage(name) {
@@ -819,6 +955,13 @@ function openModal(id) {
 
 function closeModal(id) {
   document.getElementById(id).classList.remove('open');
+}
+
+function openEditUser(id, username, role) {
+  document.getElementById('editUserId').value = id;
+  document.getElementById('editUserName').value = username;
+  document.getElementById('editUserRole').value = role;
+  openModal('editUserModal');
 }
 
 // Close modal on overlay click
@@ -853,6 +996,7 @@ def login():
         if user and check_password_hash(user['password'], password):
             session['user_id'] = user['id']
             session['username'] = user['username']
+            session['role'] = user['role']
             return redirect(url_for('index'))
         error = 'Неверный логин или пароль'
     return render_template_string(LOGIN_TEMPLATE, error=error)
@@ -915,9 +1059,15 @@ def index():
         LIMIT 100
     ''').fetchall()
 
+    users = []
+    if session.get('role') == 'admin':
+        users = conn.execute('SELECT * FROM users ORDER BY id').fetchall()
+
     conn.close()
     return render_template_string(TEMPLATE, products=products, inventory=inventory,
-                                  transactions=transactions, summary=summary, today=today)
+                                  transactions=transactions, summary=summary, today=today,
+                                  role=session.get('role'), username=session.get('username'),
+                                  users=users, session_user_id=session.get('user_id'))
 
 @app.route('/add_product', methods=['POST'])
 @login_required
@@ -969,6 +1119,55 @@ def delete_product(product_id):
     conn.execute('DELETE FROM products WHERE id = ?', (product_id,))
     conn.commit()
     conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/add_user', methods=['POST'])
+@admin_required
+def add_user():
+    username = request.form['username'].strip()
+    password = request.form['password']
+    role = request.form['role']
+    if username and password:
+        conn = get_db()
+        try:
+            conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                         (username, generate_password_hash(password), role))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/edit_user', methods=['POST'])
+@admin_required
+def edit_user():
+    user_id = int(request.form['user_id'])
+    username = request.form['username'].strip()
+    password = request.form.get('password', '')
+    role = request.form['role']
+    conn = get_db()
+    if password:
+        conn.execute('UPDATE users SET username=?, password=?, role=? WHERE id=?',
+                     (username, generate_password_hash(password), role, user_id))
+    else:
+        conn.execute('UPDATE users SET username=?, role=? WHERE id=?',
+                     (username, role, user_id))
+    conn.commit()
+    conn.close()
+    # Update session if editing self
+    if user_id == session.get('user_id'):
+        session['username'] = username
+        session['role'] = role
+    return redirect(url_for('index'))
+
+@app.route('/delete_user/<int:user_id>', methods=['POST'])
+@admin_required
+def delete_user(user_id):
+    if user_id != session.get('user_id'):
+        conn = get_db()
+        conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        conn.commit()
+        conn.close()
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
