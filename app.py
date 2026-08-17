@@ -10,41 +10,68 @@ import re
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'easystock-secret-key-change-me')
 
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
-USE_PG = DATABASE_URL.startswith('postgres')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Пароли стартовых учёток. На проде задаются переменными окружения,
-# локально — привычные значения для удобства разработки.
+# Многокомпанейность: у каждой компании СВОЯ база данных.
+# DATABASE_URL — это база-реестр, в ней лежит только список компаний
+# и строки подключения к их базам. Товаров и операций в реестре нет.
+REGISTRY_URL = os.environ.get('DATABASE_URL', '')
+USE_PG = REGISTRY_URL.startswith('postgres')
+
+# Пароли стартовых учёток компании. Задаются при её создании,
+# эти значения — только запасные по умолчанию.
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 SELLER_PASSWORD = os.environ.get('SELLER_PASSWORD', 'seller123')
 
-if USE_PG and not os.environ.get('ADMIN_PASSWORD'):
-    print('[EasyStock] ВНИМАНИЕ: ADMIN_PASSWORD не задан, используется admin123. '
-          'Смените пароль сразу после первого входа.')
-if USE_PG and not os.environ.get('SECRET_KEY'):
-    print('[EasyStock] ВНИМАНИЕ: SECRET_KEY не задан, сессии уязвимы. '
-          'Задайте SECRET_KEY в переменных окружения.')
+# Владелец сервиса. Заводит компании, внутрь их данных не заходит.
+SUPERADMIN_USERNAME = os.environ.get('SUPERADMIN_USERNAME', 'superadmin')
+SUPERADMIN_PASSWORD = os.environ.get('SUPERADMIN_PASSWORD', 'super123')
 
 if USE_PG:
     import psycopg2
     import psycopg2.extras
-    if DATABASE_URL.startswith('postgres://'):
-        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    if REGISTRY_URL.startswith('postgres://'):
+        REGISTRY_URL = REGISTRY_URL.replace('postgres://', 'postgresql://', 1)
+    if not os.environ.get('SECRET_KEY'):
+        print('[EasyStock] ВНИМАНИЕ: SECRET_KEY не задан, сессии уязвимы.')
+    if not os.environ.get('SUPERADMIN_PASSWORD'):
+        print('[EasyStock] ВНИМАНИЕ: SUPERADMIN_PASSWORD не задан, используется '
+              'super123. Задайте его в переменных окружения.')
 else:
     import sqlite3
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'inventory.db')
+    REGISTRY_URL = os.path.join(BASE_DIR, 'registry.db')
+
+
+def connect(target):
+    """Подключение к произвольной базе.
+
+    target — строка postgresql://... на проде либо имя файла SQLite локально.
+    """
+    if USE_PG:
+        conn = psycopg2.connect(target)
+        conn.autocommit = False
+        return conn
+    conn = sqlite3.connect(target if os.path.isabs(target) else os.path.join(BASE_DIR, target))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def get_registry():
+    """Соединение с базой-реестром компаний."""
+    return connect(REGISTRY_URL)
 
 
 def get_db():
-    if USE_PG:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = False
-        return conn
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    """Соединение с базой ТЕКУЩЕЙ компании (определяется по сессии).
+
+    Роуты работы с товарами вызывают именно её, поэтому каждый запрос
+    автоматически попадает в базу своей компании и никогда — в чужую.
+    """
+    company = current_company()
+    if company is None:
+        raise LookupError('Компания не определена: нет активной сессии')
+    return connect(company['db_url'])
 
 
 def db_execute(conn, query, params=None):
@@ -86,8 +113,105 @@ def ensure_admin_exists(conn):
         print("[EasyStock] Учётке 'admin' восстановлена роль администратора.")
 
 
-def init_db():
-    conn = get_db()
+# --- Реестр компаний -------------------------------------------------------
+
+# Строки подключения кэшируются в памяти: иначе каждый запрос страницы
+# требовал бы лишнего обращения к реестру. В сессию их класть нельзя —
+# cookie подписан, но не зашифрован, и пароль от базы утёк бы в браузер.
+_company_cache = {}
+
+
+def _remember(row):
+    if row is None:
+        return None
+    data = dict(row)
+    _company_cache[data['id']] = data
+    return data
+
+
+def forget_companies():
+    """Сбросить кэш после изменений в реестре."""
+    _company_cache.clear()
+
+
+def find_company_by_code(code):
+    conn = get_registry()
+    row = db_fetchone(conn,
+                      'SELECT * FROM companies WHERE code = ? AND is_active = 1',
+                      (code.strip().lower(),))
+    conn.close()
+    return _remember(row)
+
+
+def get_company(company_id):
+    if company_id in _company_cache:
+        return _company_cache[company_id]
+    conn = get_registry()
+    row = db_fetchone(conn, 'SELECT * FROM companies WHERE id = ?', (company_id,))
+    conn.close()
+    return _remember(row)
+
+
+def all_companies():
+    conn = get_registry()
+    rows = db_fetchall(conn, 'SELECT * FROM companies ORDER BY name')
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def current_company():
+    """Компания текущей сессии."""
+    company_id = session.get('company_id')
+    if not company_id:
+        return None
+    return get_company(company_id)
+
+
+def init_registry():
+    """Создаёт таблицу компаний. Данных компаний в реестре не хранится."""
+    conn = get_registry()
+    if USE_PG:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS companies (
+                id SERIAL PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                db_url TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (CURRENT_DATE::text)
+            )
+        ''')
+        conn.commit()
+        cur.close()
+    else:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                db_url TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (date('now'))
+            );
+        ''')
+        conn.commit()
+        # Локально сразу заводим демо-компанию на старой базе,
+        # чтобы разработка не требовала ручной настройки.
+        existing = db_fetchone(conn, 'SELECT COUNT(*) AS n FROM companies')
+        if (existing['n'] if existing else 0) == 0:
+            conn.execute(
+                'INSERT INTO companies (code, name, db_url) VALUES (?, ?, ?)',
+                ('demo', 'Демо-компания', 'inventory.db'))
+            conn.commit()
+            init_company_db('inventory.db', ADMIN_PASSWORD, SELLER_PASSWORD)
+            print("[EasyStock] Создана локальная компания 'demo' на базе inventory.db")
+    conn.close()
+
+
+def init_company_db(target, admin_password, seller_password):
+    """Разворачивает схему в базе компании и заводит две стартовые учётки."""
+    conn = connect(target)
     if USE_PG:
         cur = conn.cursor()
         cur.execute('''
@@ -118,13 +242,13 @@ def init_db():
         # Default users
         try:
             cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
-                        ('admin', generate_password_hash(ADMIN_PASSWORD), 'admin'))
+                        ('admin', generate_password_hash(admin_password), 'admin'))
             conn.commit()
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
         try:
             cur.execute('INSERT INTO users (username, password, role) VALUES (%s, %s, %s)',
-                        ('seller', generate_password_hash(SELLER_PASSWORD), 'seller'))
+                        ('seller', generate_password_hash(seller_password), 'seller'))
             conn.commit()
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
@@ -159,12 +283,12 @@ def init_db():
             pass  # колонка уже есть
         try:
             conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                         ('admin', generate_password_hash(ADMIN_PASSWORD), 'admin'))
+                         ('admin', generate_password_hash(admin_password), 'admin'))
         except sqlite3.IntegrityError:
             pass
         try:
             conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                         ('seller', generate_password_hash(SELLER_PASSWORD), 'seller'))
+                         ('seller', generate_password_hash(seller_password), 'seller'))
         except sqlite3.IntegrityError:
             pass
         ensure_admin_exists(conn)
@@ -174,7 +298,12 @@ def init_db():
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'user_id' not in session:
+        # Компания обязательна: без неё непонятно, в какую базу идти,
+        # а «просто вошедший» пользователь не должен видеть ничего.
+        if 'user_id' not in session or 'company_id' not in session:
+            return redirect(url_for('login'))
+        if current_company() is None:
+            session.clear()
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -182,10 +311,18 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'user_id' not in session:
+        if 'user_id' not in session or 'company_id' not in session:
             return redirect(url_for('login'))
         if session.get('role') != 'admin':
             return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated
+
+def superadmin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('is_superadmin'):
+            return redirect(url_for('superadmin_login'))
         return f(*args, **kwargs)
     return decorated
 
@@ -291,8 +428,13 @@ body {
   {% endif %}
   <form method="POST">
     <div class="form-group">
+      <label class="form-label">Код компании</label>
+      <input class="form-control" type="text" name="company" placeholder="Например: acme"
+             value="{{ company_code or '' }}" required autofocus autocapitalize="off" autocorrect="off">
+    </div>
+    <div class="form-group">
       <label class="form-label">Логин</label>
-      <input class="form-control" type="text" name="username" placeholder="Введите логин" required autofocus>
+      <input class="form-control" type="text" name="username" placeholder="Введите логин" required>
     </div>
     <div class="form-group">
       <label class="form-label">Пароль</label>
@@ -300,6 +442,11 @@ body {
     </div>
     <button type="submit" class="btn-login">Войти</button>
   </form>
+  <div style="margin-top:18px;text-align:center;">
+    <a href="/superadmin/login" style="font-size:11px;color:var(--text3);text-decoration:none;">
+      Вход для владельца сервиса
+    </a>
+  </div>
   {% if is_local %}
   <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:16px;">
     <div style="font-size:11px;color:var(--text3);margin-bottom:10px;text-align:center;">Быстрый вход (только локально):</div>
@@ -691,7 +838,7 @@ body {
 <aside class="sidebar" id="sidebar">
   <div class="logo">
     <div class="logo-title">EasyStock</div>
-    <div class="logo-sub">Учёт товаров</div>
+    <div class="logo-sub" title="{{ company_name }}">{{ company_name or 'Учёт товаров' }}</div>
   </div>
   <nav class="nav">
     <a class="nav-item active" data-page="dashboard" onclick="showPage('dashboard')">
@@ -1356,22 +1503,44 @@ function confirmUpload() {
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if 'user_id' in session:
+    if 'user_id' in session and 'company_id' in session:
         return redirect(url_for('index'))
     error = None
+    company_code = ''
     if request.method == 'POST':
+        company_code = request.form.get('company', '').strip()
         username = request.form['username'].strip()
         password = request.form['password']
-        conn = get_db()
-        user = db_fetchone(conn, 'SELECT * FROM users WHERE username = ?', (username,))
-        conn.close()
-        if user and check_password_hash(user['password'], password):
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['role'] = user['role']
-            return redirect(url_for('index'))
-        error = 'Неверный логин или пароль'
-    return render_template_string(LOGIN_TEMPLATE, error=error, is_local=not USE_PG)
+
+        company = find_company_by_code(company_code)
+        if company is None:
+            # Не уточняем, что именно неверно: иначе форму можно использовать
+            # для перебора существующих кодов компаний.
+            error = 'Неверный код компании, логин или пароль'
+        else:
+            try:
+                conn = connect(company['db_url'])
+                user = db_fetchone(conn, 'SELECT * FROM users WHERE username = ?', (username,))
+                conn.close()
+            except Exception as e:
+                print(f"[EasyStock] Не удалось подключиться к базе компании "
+                      f"{company['code']}: {e}")
+                user = None
+                error = 'База компании недоступна, обратитесь к администратору'
+
+            if error is None:
+                if user and check_password_hash(user['password'], password):
+                    session.clear()
+                    session['company_id'] = company['id']
+                    session['company_code'] = company['code']
+                    session['company_name'] = company['name']
+                    session['user_id'] = user['id']
+                    session['username'] = user['username']
+                    session['role'] = user['role']
+                    return redirect(url_for('index'))
+                error = 'Неверный код компании, логин или пароль'
+    return render_template_string(LOGIN_TEMPLATE, error=error, is_local=not USE_PG,
+                                  company_code=company_code)
 
 @app.route('/logout')
 def logout():
@@ -1439,7 +1608,9 @@ def index():
     return render_template_string(TEMPLATE, products=products, inventory=inventory,
                                   transactions=transactions, summary=summary, today=today,
                                   role=session.get('role'), username=session.get('username'),
-                                  users=users, session_user_id=session.get('user_id'))
+                                  users=users, session_user_id=session.get('user_id'),
+                                  company_name=session.get('company_name'),
+                                  company_code=session.get('company_code'))
 
 @app.route('/add_product', methods=['POST'])
 @login_required
@@ -1744,7 +1915,315 @@ def import_income():
     return jsonify({'ok': True, 'count': len(rows)})
 
 
-init_db()
+# --- Панель владельца сервиса ---------------------------------------------
+
+SUPERADMIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EasyStock — Компании</title>
+<style>
+:root {
+  --bg:#0e1117; --bg2:#161b27; --bg3:#1e2535; --border:#2a3347; --border2:#374056;
+  --text:#e8ecf4; --text2:#8b95b0; --text3:#5a6480;
+  --accent:#4f8ef7; --accent2:#3b6fd4; --green:#2ecc8a; --red:#f74f4f; --yellow:#f7c44f;
+  --radius:10px; --radius2:6px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',sans-serif; background:var(--bg); color:var(--text);
+       font-size:14px; min-height:100vh; min-height:100dvh; padding:24px; }
+.wrap { max-width:1000px; margin:0 auto; }
+.head { display:flex; justify-content:space-between; align-items:center;
+        gap:12px; margin-bottom:22px; flex-wrap:wrap; }
+.head h1 { font-size:19px; color:var(--accent); }
+.head .sub { font-size:11px; color:var(--text3); margin-top:2px; }
+.card { background:var(--bg2); border:1px solid var(--border);
+        border-radius:var(--radius); margin-bottom:20px; overflow-x:auto; }
+.card-h { padding:14px 18px; border-bottom:1px solid var(--border); font-size:13px; font-weight:700; }
+.card-b { padding:18px; }
+.tbl { width:100%; border-collapse:collapse; min-width:560px; }
+.tbl th { text-align:left; padding:10px 14px; font-size:10px; font-weight:700;
+          letter-spacing:.08em; text-transform:uppercase; color:var(--text3);
+          background:var(--bg3); border-bottom:1px solid var(--border); }
+.tbl td { padding:11px 14px; font-size:12px; border-bottom:1px solid var(--border); }
+.tbl tr:last-child td { border-bottom:none; }
+.badge { display:inline-flex; padding:2px 8px; border-radius:20px; font-size:10px; font-weight:700; }
+.badge-on { background:rgba(46,204,138,.15); color:var(--green); }
+.badge-off { background:rgba(247,79,79,.15); color:var(--red); }
+.form-group { margin-bottom:14px; }
+.form-label { display:block; font-size:11px; font-weight:600; color:var(--text2); margin-bottom:5px; }
+.form-hint { font-size:10px; color:var(--text3); margin-top:4px; }
+.form-control { width:100%; padding:10px 12px; background:var(--bg3);
+                border:1px solid var(--border2); border-radius:var(--radius2);
+                color:var(--text); font-family:inherit; font-size:14px; outline:none; }
+.form-control:focus { border-color:var(--accent); }
+.row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:10px 16px;
+       border-radius:var(--radius2); font-size:12px; font-weight:600; cursor:pointer;
+       border:none; font-family:inherit; color:#fff; min-height:40px; }
+.btn-primary { background:var(--accent); }
+.btn-danger { background:#8a1a1a; color:var(--red); }
+.btn-secondary { background:var(--bg3); color:var(--text); border:1px solid var(--border2); }
+.btn-sm { padding:7px 11px; min-height:34px; font-size:11px; }
+.msg { padding:10px 14px; border-radius:var(--radius2); font-size:12px; margin-bottom:16px; }
+.msg-err { background:rgba(247,79,79,.1); border:1px solid rgba(247,79,79,.3); color:var(--red); }
+.msg-ok { background:rgba(46,204,138,.1); border:1px solid rgba(46,204,138,.3); color:var(--green); }
+.acts { display:flex; gap:6px; }
+@media (max-width:768px) {
+  body { padding:14px; }
+  .row2 { grid-template-columns:1fr; }
+  .form-control { font-size:16px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <div>
+      <h1>EasyStock — Компании</h1>
+      <div class="sub">Панель владельца сервиса</div>
+    </div>
+    <a href="/superadmin/logout" class="btn btn-secondary">Выйти</a>
+  </div>
+
+  {% if error %}<div class="msg msg-err">{{ error }}</div>{% endif %}
+  {% if ok %}<div class="msg msg-ok">{{ ok }}</div>{% endif %}
+
+  <div class="card">
+    <div class="card-h">Компании ({{ companies|length }})</div>
+    <table class="tbl">
+      <thead><tr><th>Код</th><th>Название</th><th>Создана</th><th>Статус</th><th>Действия</th></tr></thead>
+      <tbody>
+        {% for c in companies %}
+        <tr>
+          <td><code>{{ c.code }}</code></td>
+          <td>{{ c.name }}</td>
+          <td>{{ c.created_at }}</td>
+          <td>
+            {% if c.is_active %}<span class="badge badge-on">Активна</span>
+            {% else %}<span class="badge badge-off">Отключена</span>{% endif %}
+          </td>
+          <td>
+            <div class="acts">
+              <form method="POST" action="/superadmin/toggle/{{ c.id }}">
+                <button class="btn btn-secondary btn-sm">
+                  {{ 'Отключить' if c.is_active else 'Включить' }}
+                </button>
+              </form>
+              <form method="POST" action="/superadmin/delete/{{ c.id }}"
+                    onsubmit="return confirm('Убрать компанию {{ c.name }} из реестра? Её база и данные останутся нетронутыми.')">
+                <button class="btn btn-danger btn-sm">Убрать</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not companies %}
+        <tr><td colspan="5" style="text-align:center;color:var(--text3);padding:32px;">
+          Компаний пока нет — добавьте первую ниже
+        </td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-h">Добавить компанию</div>
+    <div class="card-b">
+      <form method="POST" action="/superadmin/add">
+        <div class="row2">
+          <div class="form-group">
+            <label class="form-label">Код компании</label>
+            <input class="form-control" name="code" placeholder="acme" required
+                   autocapitalize="off" autocorrect="off">
+            <div class="form-hint">Латиницей, без пробелов. Его сотрудники вводят при входе.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Название</label>
+            <input class="form-control" name="name" placeholder="ООО Акме" required>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Строка подключения к базе компании</label>
+          <input class="form-control" name="db_url" required
+                 placeholder="{{ 'postgresql://...' if use_pg else 'company_acme.db' }}">
+          <div class="form-hint">
+            {% if use_pg %}
+              Создайте отдельную базу в консоли Neon и вставьте её строку подключения.
+              Схема развернётся автоматически.
+            {% else %}
+              Локально достаточно имени файла, например company_acme.db
+            {% endif %}
+          </div>
+        </div>
+        <div class="row2">
+          <div class="form-group">
+            <label class="form-label">Пароль администратора компании</label>
+            <input class="form-control" type="text" name="admin_password" required>
+            <div class="form-hint">Логин будет admin</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Пароль продавца</label>
+            <input class="form-control" type="text" name="seller_password" required>
+            <div class="form-hint">Логин будет seller</div>
+          </div>
+        </div>
+        <button class="btn btn-primary">Создать компанию</button>
+      </form>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+'''
+
+SUPERADMIN_LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EasyStock — Вход владельца</title>
+<style>
+:root { --bg:#0e1117; --bg2:#161b27; --bg3:#1e2535; --border:#2a3347; --border2:#374056;
+        --text:#e8ecf4; --text2:#8b95b0; --text3:#5a6480; --accent:#4f8ef7; --accent2:#3b6fd4;
+        --red:#f74f4f; --radius:10px; --radius2:6px; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',sans-serif; background:var(--bg); color:var(--text);
+       min-height:100vh; min-height:100dvh; display:flex; align-items:center; justify-content:center; padding:16px; }
+.card { background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius);
+        padding:40px; width:380px; max-width:100%; box-shadow:0 4px 24px rgba(0,0,0,.4); }
+h1 { font-size:20px; color:var(--accent); text-align:center; }
+.sub { font-size:11px; color:var(--text3); text-align:center; margin:4px 0 26px; }
+.form-group { margin-bottom:16px; }
+.form-label { display:block; font-size:11px; font-weight:600; color:var(--text2); margin-bottom:5px; }
+.form-control { width:100%; padding:11px 14px; background:var(--bg3); border:1px solid var(--border2);
+                border-radius:var(--radius2); color:var(--text); font-family:inherit; font-size:14px; outline:none; }
+.form-control:focus { border-color:var(--accent); }
+.btn { width:100%; padding:13px; background:var(--accent); color:#fff; border:none;
+       border-radius:var(--radius2); font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }
+.btn:hover { background:var(--accent2); }
+.err { background:rgba(247,79,79,.1); border:1px solid rgba(247,79,79,.3); color:var(--red);
+       padding:9px 12px; border-radius:var(--radius2); font-size:12px; margin-bottom:16px; text-align:center; }
+.back { display:block; text-align:center; margin-top:18px; font-size:11px; color:var(--text3); text-decoration:none; }
+@media (max-width:480px) { .card { padding:28px 22px; } .form-control { font-size:16px; } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>EasyStock</h1>
+  <div class="sub">Вход для владельца сервиса</div>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <div class="form-group">
+      <label class="form-label">Логин</label>
+      <input class="form-control" name="username" required autofocus autocapitalize="off">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Пароль</label>
+      <input class="form-control" type="password" name="password" required>
+    </div>
+    <button class="btn">Войти</button>
+  </form>
+  <a class="back" href="/login">← Вход для сотрудников компании</a>
+</div>
+</body>
+</html>
+'''
+
+
+@app.route('/superadmin/login', methods=['GET', 'POST'])
+def superadmin_login():
+    if session.get('is_superadmin'):
+        return redirect(url_for('superadmin'))
+    error = None
+    if request.method == 'POST':
+        if (request.form.get('username', '').strip() == SUPERADMIN_USERNAME
+                and request.form.get('password', '') == SUPERADMIN_PASSWORD):
+            session.clear()
+            session['is_superadmin'] = True
+            return redirect(url_for('superadmin'))
+        error = 'Неверный логин или пароль'
+    return render_template_string(SUPERADMIN_LOGIN_TEMPLATE, error=error)
+
+
+@app.route('/superadmin/logout')
+def superadmin_logout():
+    session.clear()
+    return redirect(url_for('superadmin_login'))
+
+
+@app.route('/superadmin')
+@superadmin_required
+def superadmin():
+    return render_template_string(
+        SUPERADMIN_TEMPLATE, companies=all_companies(), use_pg=USE_PG,
+        error=request.args.get('error'), ok=request.args.get('ok'))
+
+
+@app.route('/superadmin/add', methods=['POST'])
+@superadmin_required
+def superadmin_add():
+    code = request.form.get('code', '').strip().lower()
+    name = request.form.get('name', '').strip()
+    db_url = request.form.get('db_url', '').strip()
+    admin_password = request.form.get('admin_password', '')
+    seller_password = request.form.get('seller_password', '')
+
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{1,31}', code):
+        return redirect(url_for('superadmin', error='Код: латиница, цифры, дефис; от 2 до 32 знаков'))
+
+    conn = get_registry()
+    if db_fetchone(conn, 'SELECT id FROM companies WHERE code = ?', (code,)):
+        conn.close()
+        return redirect(url_for('superadmin', error=f'Компания с кодом {code} уже есть'))
+    conn.close()
+
+    # Схему разворачиваем ДО записи в реестр: если база недоступна,
+    # в реестре не останется компании, в которую нельзя войти.
+    try:
+        init_company_db(db_url, admin_password, seller_password)
+    except Exception as e:
+        return redirect(url_for('superadmin', error=f'База недоступна: {e}'))
+
+    conn = get_registry()
+    db_execute(conn, 'INSERT INTO companies (code, name, db_url) VALUES (?, ?, ?)',
+               (code, name, db_url))
+    conn.commit()
+    conn.close()
+    forget_companies()
+    return redirect(url_for('superadmin', ok=f'Компания «{name}» создана, код входа: {code}'))
+
+
+@app.route('/superadmin/toggle/<int:company_id>', methods=['POST'])
+@superadmin_required
+def superadmin_toggle(company_id):
+    conn = get_registry()
+    db_execute(conn,
+               'UPDATE companies SET is_active = 1 - is_active WHERE id = ?',
+               (company_id,))
+    conn.commit()
+    conn.close()
+    forget_companies()
+    return redirect(url_for('superadmin'))
+
+
+@app.route('/superadmin/delete/<int:company_id>', methods=['POST'])
+@superadmin_required
+def superadmin_delete(company_id):
+    # Удаляем только запись реестра. База компании и все её данные остаются:
+    # снести чужую базу одним кликом — слишком опасная операция.
+    conn = get_registry()
+    db_execute(conn, 'DELETE FROM companies WHERE id = ?', (company_id,))
+    conn.commit()
+    conn.close()
+    forget_companies()
+    return redirect(url_for('superadmin', ok='Компания убрана из реестра, её база не тронута'))
+
+
+init_registry()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
