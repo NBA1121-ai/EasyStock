@@ -69,6 +69,20 @@ def db_fetchone(conn, query, params=None):
     return cur.fetchone()
 
 
+def ensure_admin_exists(conn):
+    """Гарантирует, что в системе есть хотя бы один администратор.
+
+    На базах, созданных до появления ролей, ALTER TABLE проставляет всем
+    пользователям роль 'seller' — включая учётку admin. Повторный INSERT
+    её не исправляет (логин уже занят), и система остаётся без админа.
+    """
+    row = db_fetchone(conn, "SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+    count = row['n'] if row else 0
+    if count == 0:
+        db_execute(conn, "UPDATE users SET role = 'admin' WHERE username = 'admin'")
+        print("[EasyStock] Учётке 'admin' восстановлена роль администратора.")
+
+
 def init_db():
     conn = get_db()
     if USE_PG:
@@ -111,6 +125,8 @@ def init_db():
             conn.commit()
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
+        ensure_admin_exists(conn)
+        conn.commit()
         cur.close()
     else:
         conn.executescript('''
@@ -148,6 +164,7 @@ def init_db():
                          ('seller', generate_password_hash(SELLER_PASSWORD), 'seller'))
         except sqlite3.IntegrityError:
             pass
+        ensure_admin_exists(conn)
         conn.commit()
     conn.close()
 
@@ -251,6 +268,13 @@ body {
   margin-bottom: 16px;
   text-align: center;
 }
+@media (max-width: 480px) {
+  body { padding: 16px; align-items: flex-start; padding-top: 8vh; }
+  .login-card { padding: 28px 22px; width: 100%; }
+  /* 16px не даёт iOS зумить страницу при фокусе на поле */
+  .form-control { font-size: 16px; padding: 12px 14px; }
+  .btn-login { padding: 14px; font-size: 15px; }
+}
 </style>
 </head>
 <body>
@@ -341,8 +365,10 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   font-size: 14px;
+  overflow-x: hidden;
 }
 
 /* SIDEBAR */
@@ -397,7 +423,11 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  /* Без min-width:0 flex-элемент не сжимается уже своего содержимого,
+     и широкая таблица растягивает всю страницу вбок. */
+  min-width: 0;
 }
+.page > * { min-width: 0; }
 .topbar {
   height: 56px;
   background: var(--bg2);
@@ -553,24 +583,109 @@ body {
 .profit-pos { color: var(--green); font-weight: 600; }
 .profit-neg { color: var(--red); font-weight: 600; }
 
+/* PAGE HEAD */
+.page-head {
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 12px; margin-bottom: 20px;
+}
+.page-head-actions { display: flex; gap: 8px; }
+
+/* BURGER + BACKDROP (мобильное меню) */
+.burger {
+  display: none;
+  background: none; border: none; color: var(--text);
+  font-size: 22px; cursor: pointer; padding: 4px 12px 4px 0;
+  line-height: 1; font-family: inherit;
+}
+.sidebar-backdrop {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 99;
+}
+.sidebar-backdrop.open { display: block; }
+
 /* SCROLLBAR */
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
-@media (max-width: 768px) {
-  .sidebar { width: 60px; }
-  .sidebar .logo-title, .sidebar .logo-sub, .sidebar .nav-item span:not(.icon) { display: none; }
-  .main { margin-left: 60px; }
+/* ===== ПЛАНШЕТ ===== */
+@media (max-width: 1024px) {
   .stats-grid { grid-template-columns: 1fr 1fr; }
-  .nav-item { padding: 11px 0; justify-content: center; }
+  .page { padding: 18px; }
+}
+
+/* ===== ТЕЛЕФОН ===== */
+@media (max-width: 768px) {
+  /* Меню выезжает поверх контента, а не сжимает его */
+  .sidebar {
+    width: 260px;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    box-shadow: var(--shadow);
+  }
+  .sidebar.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .burger { display: block; }
+
+  .topbar { padding: 0 14px; height: 52px; }
+  .topbar-title { font-size: 15px; }
+  .page { padding: 14px; }
+
+  /* Заголовок страницы и кнопки — в столбик, кнопки на всю ширину */
+  .page-head { flex-direction: column; align-items: stretch; gap: 10px; }
+  .page-head-actions { width: 100%; }
+  .page-head-actions .btn { flex: 1; justify-content: center; }
+
+  /* Таблицы прокручиваются внутри карточки, страница вбок не едет */
+  .card { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tbl { min-width: 560px; }
+
+  .stat-value { font-size: 21px; }
+  .stat-icon { font-size: 22px; right: 12px; top: 12px; }
+  .stat-card { padding: 14px; }
+  .stats-grid { gap: 10px; }
+
+  /* Формы — в одну колонку */
+  .form-row, .form-row3 { grid-template-columns: 1fr; }
+
+  /* 16px не даёт iOS зумить страницу при фокусе на поле */
+  .form-control { font-size: 16px; padding: 10px 12px; }
+
+  /* Удобные для пальца кнопки */
+  .btn { padding: 10px 14px; min-height: 40px; }
+  .btn-sm { padding: 8px 10px; min-height: 34px; }
+
+  /* Модалки — на всю ширину экрана снизу */
+  .modal-overlay { align-items: flex-end; }
+  .modal {
+    width: 100% !important; max-width: 100%;
+    max-height: 88vh;
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .modal-header { padding: 14px 16px; }
+  .modal-body { padding: 16px; }
+  .modal-footer { padding: 12px 16px; }
+  .modal-footer .btn { flex: 1; justify-content: center; }
+
+  .notif { left: 12px; right: 12px; top: 12px; }
+  .notif.show { transform: translateY(0); }
+  .notif:not(.show) { transform: translateY(-150%); }
+}
+
+/* ===== УЗКИЙ ТЕЛЕФОН ===== */
+@media (max-width: 400px) {
+  .stats-grid { grid-template-columns: 1fr; }
+  .page { padding: 12px; }
 }
 </style>
 </head>
 <body>
 
 <!-- SIDEBAR -->
-<aside class="sidebar">
+<div class="sidebar-backdrop" id="sidebarBackdrop" onclick="closeSidebar()"></div>
+<aside class="sidebar" id="sidebar">
   <div class="logo">
     <div class="logo-title">EasyStock</div>
     <div class="logo-sub">Учёт товаров</div>
@@ -619,6 +734,7 @@ body {
 <!-- MAIN -->
 <main class="main">
   <div class="topbar">
+    <button class="burger" id="burger" onclick="toggleSidebar()" aria-label="Меню">☰</button>
     <div class="topbar-title" id="pageTitle">Дашборд</div>
   </div>
 
@@ -682,9 +798,9 @@ body {
 
   <!-- INCOME PAGE -->
   <div class="page" id="page-income">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+    <div class="page-head">
       <div style="font-size:12px;color:var(--text3);">Приход товаров</div>
-      <div style="display:flex;gap:8px;">
+      <div class="page-head-actions">
         <button class="btn btn-secondary" onclick="openModal('uploadModal')">📎 Загрузить из файла</button>
         <button class="btn btn-primary" onclick="openModal('incomeModal')">+ Новый приход</button>
       </div>
@@ -717,7 +833,7 @@ body {
 
   <!-- EXPENSE PAGE -->
   <div class="page" id="page-expense">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+    <div class="page-head">
       <div style="font-size:12px;color:var(--text3);">Расход товаров</div>
       <button class="btn btn-primary" onclick="openModal('expenseModal')">+ Новый расход</button>
     </div>
@@ -817,7 +933,7 @@ body {
 
   <!-- PRODUCTS PAGE -->
   <div class="page" id="page-products">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+    <div class="page-head">
       <div style="font-size:12px;color:var(--text3);">Справочник товаров</div>
       <button class="btn btn-primary" onclick="openModal('productModal')">+ Добавить товар</button>
     </div>
@@ -846,7 +962,7 @@ body {
   <!-- USERS PAGE (admin only) -->
   {% if role == 'admin' %}
   <div class="page" id="page-users">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+    <div class="page-head">
       <div style="font-size:12px;color:var(--text3);">Управление пользователями</div>
       <button class="btn btn-primary" onclick="openModal('userModal')">+ Добавить пользователя</button>
     </div>
@@ -1116,7 +1232,27 @@ function showPage(name) {
   document.getElementById('page-' + name).classList.add('active');
   document.querySelector('[data-page="' + name + '"]').classList.add('active');
   document.getElementById('pageTitle').textContent = pageTitles[name] || name;
+  closeSidebar();
+  window.scrollTo(0, 0);
 }
+
+// --- Мобильное меню ---
+function toggleSidebar() {
+  const open = document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebarBackdrop').classList.toggle('open', open);
+  document.body.style.overflow = open ? 'hidden' : '';
+}
+
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarBackdrop').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+// При повороте экрана / переходе на десктоп меню не должно залипать открытым
+window.addEventListener('resize', () => {
+  if (window.innerWidth > 768) closeSidebar();
+});
 
 function openModal(id) {
   document.getElementById(id).classList.add('open');
@@ -1144,6 +1280,7 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') {
     document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
+    closeSidebar();
   }
 });
 
